@@ -67,7 +67,7 @@ func TestPathErrors(t *testing.T) {
 
 	// fs.Create doesn't return an error
 
-	err = fs.Mkdir(path2, perm)
+	err = fs.MkdirAll(path2, perm)
 	if err != nil {
 		t.Error(err)
 	}
@@ -915,6 +915,96 @@ func TestMemMapFsRename(t *testing.T) {
 
 		if dataCnt != len(fs.getData()) {
 			t.Errorf("invalid data len: expected %v, get %v", dataCnt, len(fs.getData()))
+		}
+	}
+}
+
+// TestMemMapFsRenameLockCorruption reproduces a bug where Rename returns while
+// holding a write lock but the deferred RUnlock runs, causing:
+//
+//	RUnlock of unlocked RWMutex
+//
+// Test: go test . -race -count=10 -run=TestMemMapFsRenameLockCorruption
+func TestMemMapFsRenameLockCorruption(t *testing.T) {
+	for range 10 {
+		fs := NewMemMapFs()
+		if err := fs.MkdirAll("/a/b", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fs.Create("/a/b/c"); err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			fs.RemoveAll("/a/b")
+		}()
+
+		go func() {
+			defer wg.Done()
+			fs.Rename("/a/b/c", "/x")
+		}()
+
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("deadlock")
+		}
+	}
+}
+
+// TestMemMapFsRemoveAllCreateRace reproduces a bug where a RemoveAll and Create
+// race leaves the filesystem in an inconsistent state where a file exists
+// without its parent.
+//
+//	dir/file exists but /dir does not
+//
+// Test: go test . -race -count=100 -run=TestMemMapFsRemoveAllCreateRace
+func TestMemMapFsRemoveAllCreateRace(t *testing.T) {
+	for range 10 {
+		fs := NewMemMapFs()
+		if err := fs.MkdirAll("/dir", 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(4)
+
+		go func() {
+			defer wg.Done()
+			fs.RemoveAll("/dir")
+		}()
+		go func() {
+			defer wg.Done()
+			fs.Create("/dir/file1")
+		}()
+		go func() {
+			defer wg.Done()
+			fs.Create("/dir/file2")
+		}()
+		go func() {
+			defer wg.Done()
+			fs.Create("/dir/file3")
+		}()
+
+		wg.Wait()
+
+		_, dirErr := fs.Stat("/dir")
+
+		for _, name := range []string{"/dir/file1", "/dir/file2", "/dir/file3"} {
+			_, fileErr := fs.Stat(name)
+			if dirErr != nil && fileErr == nil {
+				t.Errorf("%s exists but /dir does not", name)
+			}
 		}
 	}
 }
